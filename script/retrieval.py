@@ -1,130 +1,239 @@
+import hashlib
+import json
+import logging
+import re
+import time
+
 from qdrant_client import QdrantClient
 from sentence_transformers import SentenceTransformer
-import logging
-import json
-import hashlib
-import re
-from script.cache import redis_client, CACHE_TTL_SECONDS, make_cache_key
+
+from script.cache import (
+    redis_client,
+    CACHE_TTL_SECONDS,
+    make_cache_key,
+)
 
 
 logger = logging.getLogger(__name__)
+
 COLLECTION_NAME = "policy_docs"
 TOP_K = 3
-MIN_SCORE=0.25
-CACHE_TTL_SECONDS = 60 * 60 * 24 
+MIN_SCORE = 0.25
 
-logger.info("Connecting to Qdrant...")
-qdrant = QdrantClient(host="localhost", port=6333)
+qdrant = QdrantClient(
+    host="localhost",
+    port=6333,
+)
 
 logger.info("Loading embedding model...")
-model = SentenceTransformer("sentence-transformers/all-mpnet-base-v2")
 
-def retrieve(query: str):
-    # 1. Embed the query
-    logger.info("Received retrieval query")
-    logger.debug(f"Query text: {query}")
+model = SentenceTransformer(
+    "sentence-transformers/all-MiniLM-L6-v2"
+)
 
-    cache_key = make_cache_key("retrieval",query)
+
+def retrieve(query: str) -> list[dict]:
+    total_start = time.perf_counter()
+
+    normalized_query = " ".join(
+        query.strip().lower().split()
+    )
+
+    cache_key = make_cache_key(
+        "retrieval",
+        normalized_query,
+    )
+
+    redis_start = time.perf_counter()
+
     cached = redis_client.get(cache_key)
 
-    if cached:
-        logger.info("Retrieval cache hit")
-        return json.loads(cached)
-    
-    points = []
-    
-    try:
-        article_match = re.search(r'article\s*(\d+)', query, re.IGNORECASE)
-        if article_match:
-            article_id = f"article{article_match.group(1)}"
-            logger.info("Detected article lookup: %s", article_id)
+    redis_read_ms = (
+        time.perf_counter() - redis_start
+    ) * 1000
 
-            points, _ = qdrant.scroll(
+    if cached:
+        total_ms = (
+            time.perf_counter() - total_start
+        ) * 1000
+
+        logger.info("Retrieval cache hit")
+        logger.info(
+            "Retrieval Redis read: %.2f ms",
+            redis_read_ms,
+        )
+        logger.info(
+            "Retrieval total: %.2f ms",
+            total_ms,
+        )
+
+        return json.loads(cached)
+
+    logger.info(
+        "Retrieval cache miss: Redis read %.2f ms",
+        redis_read_ms,
+    )
+
+    article_match = re.search(
+        r"\barticle\s*(\d+)\b",
+        normalized_query,
+        re.IGNORECASE,
+    )
+
+    if article_match:
+        article_id = f"article{article_match.group(1)}"
+
+        logger.info(
+            "Detected article lookup: %s",
+            article_id,
+        )
+
+        qdrant_start = time.perf_counter()
+
+        points, _ = qdrant.scroll(
             collection_name=COLLECTION_NAME,
             scroll_filter={
-                "must": [{
-                    "key": "article",
-                    "match": {"value": article_id}
-                }]
+                "must": [
+                    {
+                        "key": "article",
+                        "match": {
+                            "value": article_id,
+                        },
+                    }
+                ]
             },
-            limit=50
+            limit=50,
+            with_payload=True,
+            with_vectors=False,
         )
-            
-        if points:
-            results = [{
-                "text": p.payload["text"],
-                "article": p.payload["article"],
-                "file": p.payload["file"],
-                "score": 1.0
-            } for p in points]        
 
+        qdrant_ms = (
+            time.perf_counter() - qdrant_start
+        ) * 1000
 
-            redis_client.setex(
-                cache_key,
-                CACHE_TTL_SECONDS,
-                json.dumps(results)
+        logger.info(
+            "Qdrant article lookup: %.2f ms",
+            qdrant_ms,
+        )
+
+        results = []
+
+        for point in points:
+            payload = point.payload or {}
+
+            results.append(
+                {
+                    "text": payload.get("text", ""),
+                    "article": payload.get("article"),
+                    "file": payload.get("file"),
+                    "score": 1.0,
+                }
             )
-            return results 
 
-        query_vector = model.encode(
-            query,
-            normalize_embeddings=True
-        ).tolist()
-        logger.debug("Query embedding created successfully")
-    except Exception as e:
-        logger.exception("Failed to embed query")
-        raise
+        redis_write_start = time.perf_counter()
 
-    try:
-        results = qdrant.query_points(
-            collection_name=COLLECTION_NAME,
-            query=query_vector,
-            limit=TOP_K,
-            with_payload=True
-        )
-        logger.info(f"Qdrant returned {len(results.points)} results")
-    except Exception as e:
-        logger.exception("Qdrant search failed")
-        raise
-
-    # 3. Format results
-    formatted = []
-    for hit in results.points:
-        if hit.score < MIN_SCORE:
-            continue
-        payload = hit.payload
-        score = hit.score
-
-        formatted.append({
-            "text": payload["text"],
-            "article": payload.get("article"),
-            "file": payload.get("file"),
-            "score": score
-        })
-
-    try:
         redis_client.setex(
             cache_key,
             CACHE_TTL_SECONDS,
-            json.dumps(formatted)
+            json.dumps(results),
         )
-        logger.info("Retrieval cached")
-    except Exception:
-        logger.warning("Failed to write retrieval to cache")
 
+        redis_write_ms = (
+            time.perf_counter() - redis_write_start
+        ) * 1000
 
-    logger.debug("Results formatted successfully")
-    return formatted
+        total_ms = (
+            time.perf_counter() - total_start
+        ) * 1000
 
-    
-if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO)
-    query = "Is consent required for processing personal data?"
-    results = retrieve(query)
+        logger.info(
+            "Retrieval Redis write: %.2f ms",
+            redis_write_ms,
+        )
+        logger.info(
+            "Article retrieval total: %.2f ms",
+            total_ms,
+        )
 
-    for i, r in enumerate(results, 1):
-        print(f"\n--- Result {i} ---")
-        print(f"Article: {r['article']}")
-        print(r["text"])
-      
-        
+        return results
+
+    embedding_start = time.perf_counter()
+
+    query_vector = model.encode(
+        query,
+        normalize_embeddings=True,
+        convert_to_numpy=True,
+        show_progress_bar=False,
+    ).tolist()
+
+    embedding_ms = (
+        time.perf_counter() - embedding_start
+    ) * 1000
+
+    logger.info(
+        "Query embedding: %.2f ms",
+        embedding_ms,
+    )
+
+    qdrant_start = time.perf_counter()
+
+    search_result = qdrant.query_points(
+        collection_name=COLLECTION_NAME,
+        query=query_vector,
+        limit=TOP_K,
+        with_payload=True,
+        with_vectors=False,
+    )
+
+    qdrant_ms = (
+        time.perf_counter() - qdrant_start
+    ) * 1000
+
+    logger.info(
+        "Qdrant vector search: %.2f ms",
+        qdrant_ms,
+    )
+
+    results = []
+
+    for hit in search_result.points:
+        if hit.score < MIN_SCORE:
+            continue
+
+        payload = hit.payload or {}
+
+        results.append(
+            {
+                "text": payload.get("text", ""),
+                "article": payload.get("article"),
+                "file": payload.get("file"),
+                "score": hit.score,
+            }
+        )
+
+    redis_write_start = time.perf_counter()
+
+    redis_client.setex(
+        cache_key,
+        CACHE_TTL_SECONDS,
+        json.dumps(results),
+    )
+
+    redis_write_ms = (
+        time.perf_counter() - redis_write_start
+    ) * 1000
+
+    total_ms = (
+        time.perf_counter() - total_start
+    ) * 1000
+
+    logger.info(
+        "Retrieval Redis write: %.2f ms",
+        redis_write_ms,
+    )
+    logger.info(
+        "Retrieval total: %.2f ms",
+        total_ms,
+    )
+
+    return results

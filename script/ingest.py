@@ -21,7 +21,7 @@ qdrant = QdrantClient(host="localhost", port=6333)
 model = SentenceTransformer("sentence-transformers/all-mpnet-base-v2")
 tokenizer = tiktoken.get_encoding("cl100k_base")
 
-# ---------- HELPERS ----------
+# ---------- HELPERS ---------- 
 def extract_text_from_pdf(file_path: Path) -> str:
     if file_path.suffix.lower() == ".txt":
         return file_path.read_text(encoding="utf-8")
