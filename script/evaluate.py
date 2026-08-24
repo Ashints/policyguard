@@ -1,17 +1,18 @@
 from script.retrieval import retrieve
-TEST_CASES=[
+
+TEST_CASES = [
     {
-        "question":"What principles must be followed when processing personal data?",
-        "expected_articles": ["Gdpr Article5"]
+        "question": "What principles must be followed when processing personal data?",
+        "expected_articles": ["article5"]
     },
     {
         "question": "When is processing of personal data lawful?",
-        "expected_articles": ["Gdpr Article6"]
-
+        "expected_articles": ["article6"]
     }
 ]
 
 TOP_K = 5
+
 
 def evaluate_retrieval():
     passed = 0
@@ -21,9 +22,12 @@ def evaluate_retrieval():
         expected = set(case["expected_articles"])
 
         results = retrieve(question)
-        retrieved_articles = {
-            r["article"] for r in results[:TOP_K]
-        }
+
+        retrieved_articles = [
+            r["article"]
+            for r in results[:TOP_K]
+        ]
+
         hit = expected.intersection(retrieved_articles)
 
         print("\nQuestion:", question)
@@ -36,7 +40,15 @@ def evaluate_retrieval():
         else:
             print("❌ FAIL")
 
-    print(f"\nScore: {passed}/{len(TEST_CASES)} passed")
+    total = len(TEST_CASES)
+
+    percentage = (passed / total) * 100
+
+    print("\n==============================")
+    print(f"Passed: {passed}/{total}")
+    print(f"Recall@{TOP_K}: {percentage:.2f}%")
+    print("==============================")
+
 
 if __name__ == "__main__":
-    evaluate_retrieval()    
+    evaluate_retrieval()
